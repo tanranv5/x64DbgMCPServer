@@ -115,6 +115,8 @@ namespace DotNetPlugin
                 yield break;
             }
 
+            // 0.0.0.0 可监听所有 IPv4 地址，方便局域网访问
+            yield return "0.0.0.0";
             yield return "localhost";
             yield return "127.0.0.1";
 
@@ -124,8 +126,6 @@ namespace DotNetPlugin
 
             foreach (var ip in GetLocalIpv4Addresses())
                 yield return ip;
-
-            yield return "+";
         }
 
         private static string SafeGetMachineName()
@@ -246,6 +246,15 @@ namespace DotNetPlugin
                 _listener.BeginGetContext(OnRequest, null);
                 _isRunning = true;
                 Console.WriteLine("MCP server started. CurrentlyDebugging: " + Bridge.DbgIsDebugging() + " IsRunning: " + Bridge.DbgIsRunning());
+            }
+            catch (HttpListenerException ex)
+            {
+                Console.WriteLine("Failed to start MCP server: " + ex.Message);
+                var hint = GetHttpListenerTroubleshootingHint(ex);
+                if (!string.IsNullOrEmpty(hint))
+                {
+                    Console.WriteLine(hint);
+                }
             }
             catch (Exception ex)
             {
@@ -1113,6 +1122,30 @@ namespace DotNetPlugin
             response.Headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS";
             response.Headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization";
             response.Headers["Access-Control-Max-Age"] = "86400";
+        }
+
+        // 根据 HttpListener 错误码给出诊断提示，便于用户快速排查
+        private string GetHttpListenerTroubleshootingHint(HttpListenerException ex)
+        {
+            if (ex == null)
+                return string.Empty;
+
+            if (ex.NativeErrorCode == 183) // ERROR_ALREADY_EXISTS
+            {
+                return $"HTTP 前缀已被其他进程或 URLACL 占用。请确保没有其它 MCP/x64dbg 实例在监听，并可通过命令检查/释放：" +
+                       Environment.NewLine +
+                       $"  netstat -ano | findstr {_port}" + Environment.NewLine +
+                       $"  netsh http show urlacl | findstr {_port}" + Environment.NewLine +
+                       $"如需释放可执行：netsh http delete urlacl url=http://+:{_port}/sse/ 以及 message 对应条目。";
+            }
+
+            if (ex.NativeErrorCode == 5) // ERROR_ACCESS_DENIED
+            {
+                return "当前进程缺少监听该端口的权限。请以管理员身份运行 x64dbg，或先执行 `netsh http add urlacl url=http://+:" +
+                       _port + "/sse/ user=Everyone`（message 路径同理）后再启动。";
+            }
+
+            return string.Empty;
         }
 
     }
