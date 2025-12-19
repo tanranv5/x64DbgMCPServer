@@ -6,7 +6,6 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
-using System.Net.Sockets;
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
@@ -17,15 +16,9 @@ namespace DotNetPlugin
 {
     class SimpleMcpServer
     {
-        private const int DefaultPort = 50300;
-        private const string HostEnvVar = "MCP_SERVER_HOSTS";
-        private const string PortEnvVar = "MCP_SERVER_PORT";
-
         private readonly HttpListener _listener = new HttpListener();
         private readonly Dictionary<string, MethodInfo> _commands = new Dictionary<string, MethodInfo>(StringComparer.OrdinalIgnoreCase);
         private readonly Type _targetType;
-        private readonly List<string> _registeredPrefixes = new List<string>();
-        private readonly int _port;
 
         public bool IsActivelyDebugging
         {
@@ -37,11 +30,16 @@ namespace DotNetPlugin
         {
             //DisableServerHeader(); //Prob not needed
             _targetType = commandSourceType;
-            _port = ResolvePort();
 
-            RegisterPrefixes();
+            // "+" 表示监听所有网络接口 (等同于 0.0.0.0)
+            // 这允许通过本地回环地址、局域网IP和所有网络接口访问
+            // 注意: 在Windows上监听非localhost地址可能需要管理员权限或配置URL ACL
+            string IPAddress = "+";
+            Console.WriteLine("MCP server listening on 0.0.0.0:50300 (all network interfaces)");
+            _listener.Prefixes.Add("http://" + IPAddress + ":50300/sse/"); //Request come in without a trailing '/' but are still handled
+            _listener.Prefixes.Add("http://" + IPAddress + ":50300/message/");
 
-            //_listener.Prefixes.Add("http://127.0.0.1:50300/sse/"); //Request come in without a trailing '/' but are still handled
+            //_listener.Prefixes.Add("http://127.0.0.1:50300/sse/"); //仅本地访问
             //_listener.Prefixes.Add("http://127.0.0.1:50300/message/");
             // Reflect and register [Command] methods
             foreach (var method in commandSourceType.GetMethods(BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic))
@@ -49,119 +47,6 @@ namespace DotNetPlugin
                 var attr = method.GetCustomAttribute<CommandAttribute>();
                 if (attr != null)
                     _commands[attr.Name] = method;
-            }
-        }
-
-        private void RegisterPrefixes()
-        {
-            var hosts = ResolveHosts().Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-            foreach (var host in hosts)
-            {
-                TryRegisterPrefix(host, "sse");
-                TryRegisterPrefix(host, "message");
-            }
-
-            if (_registeredPrefixes.Count == 0)
-            {
-                throw new InvalidOperationException("No HTTP prefixes could be registered. Check permissions or configure MCP_SERVER_HOSTS.");
-            }
-
-            Console.WriteLine("MCP server listening on port " + _port);
-            foreach (var prefix in _registeredPrefixes)
-            {
-                Console.WriteLine("  Registered prefix: " + prefix);
-            }
-        }
-
-        private void TryRegisterPrefix(string host, string relativePath)
-        {
-            if (string.IsNullOrWhiteSpace(host))
-                return;
-
-            var normalizedPath = (relativePath ?? string.Empty).Trim('/');
-            var prefix = $"http://{host}:{_port}/{normalizedPath}/";
-
-            try
-            {
-                _listener.Prefixes.Add(prefix);
-                _registeredPrefixes.Add(prefix);
-            }
-            catch (Exception ex) when (ex is HttpListenerException || ex is InvalidOperationException)
-            {
-                Console.WriteLine($"Failed to register prefix {prefix}: {ex.Message}");
-            }
-        }
-
-        private static int ResolvePort()
-        {
-            var envValue = Environment.GetEnvironmentVariable(PortEnvVar);
-            if (!string.IsNullOrWhiteSpace(envValue) && int.TryParse(envValue, out var parsed) && parsed > 0 && parsed < 65535)
-            {
-                return parsed;
-            }
-
-            return DefaultPort;
-        }
-
-        private IEnumerable<string> ResolveHosts()
-        {
-            var envValue = Environment.GetEnvironmentVariable(HostEnvVar);
-            if (!string.IsNullOrWhiteSpace(envValue))
-            {
-                foreach (var host in envValue.Split(new[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries))
-                {
-                    yield return host.Trim();
-                }
-                yield break;
-            }
-
-            // 0.0.0.0 可监听所有 IPv4 地址，方便局域网访问
-            yield return "0.0.0.0";
-            yield return "localhost";
-            yield return "127.0.0.1";
-
-            var machineName = SafeGetMachineName();
-            if (!string.IsNullOrWhiteSpace(machineName))
-                yield return machineName;
-
-            foreach (var ip in GetLocalIpv4Addresses())
-                yield return ip;
-        }
-
-        private static string SafeGetMachineName()
-        {
-            try
-            {
-                return Dns.GetHostName();
-            }
-            catch
-            {
-                return string.Empty;
-            }
-        }
-
-        private static IEnumerable<string> GetLocalIpv4Addresses()
-        {
-            var machineName = SafeGetMachineName();
-            if (string.IsNullOrWhiteSpace(machineName))
-                yield break;
-
-            IPAddress[] addresses;
-            try
-            {
-                addresses = Dns.GetHostAddresses(machineName);
-            }
-            catch
-            {
-                yield break;
-            }
-
-            foreach (var address in addresses)
-            {
-                if (address.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(address))
-                {
-                    yield return address.ToString();
-                }
             }
         }
 
@@ -246,15 +131,6 @@ namespace DotNetPlugin
                 _listener.BeginGetContext(OnRequest, null);
                 _isRunning = true;
                 Console.WriteLine("MCP server started. CurrentlyDebugging: " + Bridge.DbgIsDebugging() + " IsRunning: " + Bridge.DbgIsRunning());
-            }
-            catch (HttpListenerException ex)
-            {
-                Console.WriteLine("Failed to start MCP server: " + ex.Message);
-                var hint = GetHttpListenerTroubleshootingHint(ex);
-                if (!string.IsNullOrEmpty(hint))
-                {
-                    Console.WriteLine(hint);
-                }
             }
             catch (Exception ex)
             {
@@ -347,16 +223,6 @@ namespace DotNetPlugin
                 try { _listener.BeginGetContext(OnRequest, null); } catch { }
             }
 
-            ApplyCorsHeaders(ctx.Response);
-            ctx.Response.Headers["Server"] = "Kestrel";
-
-            if (string.Equals(ctx.Request.HttpMethod, "OPTIONS", StringComparison.OrdinalIgnoreCase))
-            {
-                ctx.Response.StatusCode = 204;
-                ctx.Response.OutputStream.Close();
-                return;
-            }
-
             if (pDebug)
             {
                 Console.WriteLine("=== Incoming Request ===");
@@ -369,6 +235,8 @@ namespace DotNetPlugin
                 }
                 Console.WriteLine("=========================");
             }
+            string requestBody = null; // Variable to store the body
+            ctx.Response.Headers["Server"] = "Kestrel";
 
             if (ctx.Request.HttpMethod == "POST")
             {
@@ -1113,40 +981,8 @@ namespace DotNetPlugin
                 return "object";
         }
 
-        private static void ApplyCorsHeaders(HttpListenerResponse response)
-        {
-            if (response == null)
-                return;
 
-            response.Headers["Access-Control-Allow-Origin"] = "*";
-            response.Headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS";
-            response.Headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization";
-            response.Headers["Access-Control-Max-Age"] = "86400";
-        }
 
-        // 根据 HttpListener 错误码给出诊断提示，便于用户快速排查
-        private string GetHttpListenerTroubleshootingHint(HttpListenerException ex)
-        {
-            if (ex == null)
-                return string.Empty;
-
-            if (ex.NativeErrorCode == 183) // ERROR_ALREADY_EXISTS
-            {
-                return $"HTTP 前缀已被其他进程或 URLACL 占用。请确保没有其它 MCP/x64dbg 实例在监听，并可通过命令检查/释放：" +
-                       Environment.NewLine +
-                       $"  netstat -ano | findstr {_port}" + Environment.NewLine +
-                       $"  netsh http show urlacl | findstr {_port}" + Environment.NewLine +
-                       $"如需释放可执行：netsh http delete urlacl url=http://+:{_port}/sse/ 以及 message 对应条目。";
-            }
-
-            if (ex.NativeErrorCode == 5) // ERROR_ACCESS_DENIED
-            {
-                return "当前进程缺少监听该端口的权限。请以管理员身份运行 x64dbg，或先执行 `netsh http add urlacl url=http://+:" +
-                       _port + "/sse/ user=Everyone`（message 路径同理）后再启动。";
-            }
-
-            return string.Empty;
-        }
 
     }
 }
