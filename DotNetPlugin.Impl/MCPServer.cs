@@ -126,6 +126,14 @@ namespace DotNetPlugin
                 _listener.Start();
                 _listener.BeginGetContext(OnRequest, null);
                 _isRunning = true;
+                 var host = Dns.GetHostEntry(Dns.GetHostName());
+                foreach (var ip in host.AddressList)
+                {
+                    if (ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+                    {
+                        Console.WriteLine($"Server accessible at: http://{ip}:50300/");
+                    }
+                }
                 Console.WriteLine("MCP server started. CurrentlyDebugging: " + Bridge.DbgIsDebugging() + " IsRunning: " + Bridge.DbgIsRunning());
             }
             catch (Exception ex)
